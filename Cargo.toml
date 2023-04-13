@@ -15,3 +15,4 @@ version-compare = {version = "0.1.1"}
 futures-util = {version = "0.3.27"}
 linya = {version = "0.3.0"}
 lazy_static = {version = "1.4.0"}
+human_bytes = {version = "0.4.1"}
