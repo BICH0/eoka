@@ -333,12 +333,12 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
             std::fs::remove_file(format!("{}bps/{}",EOKA_LOCAL,&pkg));
         }
         std::fs::remove_dir_all(&tempdir);
-        std::fs::remove_file(format!("{}{}.tgz",EOKA_TMP,&pkg));
+        std::fs::remove_file(format!("{}{}.ek",EOKA_TMP,&pkg));
         std::fs::remove_file(format!("{}{}.b3",EOKA_TMP,&pkg));
         print_exit(0,"",true);
     }
     let pkg:String = format!("{}-{}",pkgname,pkgversion);
-    if ! hash_check(format!("{}.tgz",&pkg).as_str(),mirrors).await {
+    if ! hash_check(format!("{}.ek",&pkg).as_str(),mirrors).await {
         println!("File integrity check failed, aborting installation...");
         return;
     }else{
@@ -451,7 +451,7 @@ async fn reqwest_dependencies(bpdeps:&String,mirrors:&mut Vec<String>) -> Option
         if dep == ""{
             continue;
         }
-        match check_fs(format!("{}-{}.tgz",dep,LOCAL.list_pkg(LOCAL.new_con(),dep).first().unwrap().rversion).as_str(),mirrors).await{
+        match check_fs(format!("{}-{}.ek",dep,LOCAL.list_pkg(LOCAL.new_con(),dep).first().unwrap().rversion).as_str(),mirrors).await{
             None => {
                 print_exit(1,"     ",false);
                 println!("Unable to fetch {:?}", dep);
@@ -540,7 +540,7 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
         }
     };
     print!(" - Fetching package...");
-    let tgzname:&str = &format!("{}-{}.tgz",pkg[0],pkg[1]);
+    let tgzname:&str = &format!("{}-{}.ek",pkg[0],pkg[1]);
     let resp:Response = match check_fs(tgzname,mirrors).await{
         Some(resp) => {
             if resp.status().as_str() == "404"{
@@ -616,7 +616,7 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
             };
             let dep_n:String = dep_tmp.clone().nth(0).unwrap().to_string();
             // println!("Instalando {:?} {:?}", dep_n, dep_v);
-            unpack(&dep_n,&dep_v,get_file(dep,&format!("{}-{}.tgz",dep_n,dep_v)).await, mirrors, upgrade,&oldv).await;
+            unpack(&dep_n,&dep_v,get_file(dep,&format!("{}-{}.ek",dep_n,dep_v)).await, mirrors, upgrade,&oldv).await;
         }
     }
     unpack(pkg[0],pkg[1], get_file(resp,tgzname).await, mirrors,upgrade,&oldv).await;
@@ -779,7 +779,7 @@ async fn main(){
     let mut args:Vec<String> = env::args().collect();
     for x in 1..args.len(){
         match args[x].as_str(){
-            "-s" | "-S" | "update" | "sync" =>{
+            "-S" | "update" | "sync" =>{
                 let mut mirrors:Vec<String> = fetch_mirrors().await;
                 println!("Syncing the database");
                 let res:Option<Response> = check_fs("eoka.db",&mut mirrors).await;
@@ -822,7 +822,7 @@ async fn main(){
                 println!("Update endeded with {} new packages, and {} updates available.",&n,&u);
                 return
             },
-            "upgrade" => {
+            "-U"|"upgrade" => {
                 let mut mirrors:Vec<String> = fetch_mirrors().await;
                 if args.len() == x+1{
                     let mut up = 0;
@@ -842,7 +842,7 @@ async fn main(){
                     return
                 }
             },
-            "-i" | "install" => {
+            "-I"|"install"|"get" => {
                 let packages:Vec<String>=args.drain(x+1..).collect();
                 let mut mirrors:Vec<String> = fetch_mirrors().await;
                 for package in packages{
@@ -850,7 +850,7 @@ async fn main(){
                 }
                 return
             },
-            "list" => {
+            "-L"|"list" => {
                 if args.len() == x+1{
                     args.push("all".to_string());
                 }
@@ -900,7 +900,7 @@ async fn main(){
                         }
                         //Por cada paquete mostrar nombre, version y dependencias
                     },
-                    "updated" =>{
+                    "updated"|"updated" =>{
                         for line in FS.read_file(EOKA_LOCAL.to_owned()+"lastupdate.log"){
                             println!("{}",line);
                         }
