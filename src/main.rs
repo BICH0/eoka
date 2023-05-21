@@ -5,7 +5,6 @@ use std::time::Instant;
 use std::cmp::min;
 use std::io::{Write,Read,BufRead};
 use std::collections::HashMap;
-// use std::process::exit;
 use futures_util::StreamExt;
 use reqwest::{Response,Error};
 use rusqlite::{Connection,CachedStatement};
@@ -14,10 +13,14 @@ use lazy_static::lazy_static;
 use human_bytes::human_bytes;
 use blake3;
 use colored::{Colorize,ColoredString};
+#[link(name = "c")]
+extern "C" {
+    fn geteuid() -> u32;
+}
 
 const EOKA_TMP:&str = "/tmp/";
 const EOKA_LOCAL:&str = "/etc/eoka/";
-const VERSION:&str = "0.0.2";
+const VERSION:&str = "0.1.0";
 lazy_static! {
     static ref LOCAL:SQLite = SQLite::new("eoka.db",EOKA_LOCAL);//Cambiar segundo campo a eoka_local
     static ref REMOTE:SQLite = SQLite::new("eoka.db",EOKA_TMP);
@@ -219,7 +222,7 @@ async fn fetch_mirrors() -> Vec<String>{
     for line in FS.read_file(EOKA_LOCAL.to_string()+"sources.list"){
         match line.chars().nth(0).unwrap() {
             '#' => {
-                match line.as_str(){
+                match line.to_uppercase().as_str(){
                     "#MASTERS" => master=true,
                     "#SLAVES" => master=false,
                     _ => (),
@@ -481,17 +484,22 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                             let datapath:String = tempdir.to_owned()+"/data.tgz";
                             {
                                 if lines.len() >= 3{
-                                    match lines[2].split(".").nth(1){
-                                        Some(line) => {
-                                            if line == "source"{
-                                                compiled = false;
-                                                continue
-                                            }else if line == "compiled"{
-                                                compiled = true;
-                                                continue
+                                    let split:Vec<&str> = lines[2].split(":").collect();
+                                    if split[0] == "Mode"{
+                                        if split[1] == ""{
+                                            let line:String = split[1].to_lowercase();
+                                            match line.as_str(){
+                                                "source" => {
+                                                    compiled = false;
+                                                    continue
+                                                },
+                                                "compiled" => {
+                                                    compiled = true;
+                                                    continue
+                                                },
+                                                _ => ()
                                             }
-                                        },
-                                        None => (),
+                                        }
                                     }
                                 }
                                 print_exit(1,"",true);
@@ -999,6 +1007,15 @@ fn print_deps(pdeps:&Option<String>){
 }
 #[tokio::main]
 async fn main(){
+    unsafe{
+        if geteuid() != 0 {
+            println!("{}","Program is not running as root".red());
+            println!("This may cause unexpected behaviours, do you still want to proceed? y/N");
+            if ! user_input("n"){
+                return
+            }
+        }
+    }
     let mut args:Vec<String> = env::args().collect();
     for x in 1..args.len(){
         match args[x].as_str(){
