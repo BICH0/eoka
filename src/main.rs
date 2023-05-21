@@ -75,7 +75,10 @@ impl SQLite{
         let mut stmt:CachedStatement;
         if field == "rversion"{
             stmt=conn.prepare_cached("UPDATE packages SET rversion = ?1, deps = ?2 WHERE name = ?3").expect("Unable to prepare the function");
-            let ndeps = ndeps.clone().unwrap();
+            let ndeps = match ndeps.clone(){
+                Some(deps) => deps,
+                None => "".to_string()
+            };
             stmt.execute([&nvalue,&ndeps.to_string(),&pkgname.to_string()]).expect("Unable to execute the function");
         }else{
             stmt=conn.prepare_cached("UPDATE packages SET lversion = ?1 WHERE name = ?2").expect("Unable to prepare the function");
@@ -173,7 +176,7 @@ fn user_input(def:&str) -> bool{
         user_input.clear();
         std::io::stdin().read_line(&mut user_input).expect("Error reading");
         user_input = user_input.trim().to_lowercase();
-        if user_input == ""{
+        if user_input.is_empty(){
             user_input = def.to_string();
         }
     }
@@ -211,18 +214,40 @@ fn cmp_v(lv:&String, rv:&String) -> bool{//Revisar porque si hay paquetes 2.3.0-
 async fn fetch_mirrors() -> Vec<String>{
     println!("Updating mirror list...");
     let mut mirrors = Vec::new();
+    let mut master = false;
+    let mut m:u16=0;
     for line in FS.read_file(EOKA_LOCAL.to_string()+"sources.list"){
-        match reqwest::get(format!("http://{}/eoka.db",&line)).await {
-            Err(_) => {
-                print_exit(1,"  ",false);
-                println!("-> Mirror {} invalid or offline.", &line)
+        match line.chars().nth(0).unwrap() {
+            '#' => {
+                match line.as_str(){
+                    "#MASTERS" => master=true,
+                    "#SLAVES" => master=false,
+                    _ => (),
+                }
             },
-            Ok(_) => {
-                print_exit(0,"  ",false);
-                println!("{}", line);
-                mirrors.push(line);
+            _ => {
+                match reqwest::get(format!("http://{}/eoka.db",&line)).await {
+                    Err(_) => {
+                        print_exit(1,"  ",false);
+                        println!("-> Mirror {} invalid or offline.", &line)
+                    },
+                    Ok(_) => {
+                        let mut line = line;
+                        print_exit(0,"  ",false);
+                        println!("{}", line);
+                        if master {
+                            m+=1;
+                            line=format!("^{}",line);
+                        }
+                        mirrors.push(line);
+                    }
+                }
             }
         }
+    }
+    if m < 1{
+        print_exit(3,"",false);
+        println!("No master servers available, file integrity can't be ensured");
     }
     println!("");
     mirrors
@@ -239,9 +264,18 @@ async fn check_fs(name:&str,mirrors:&mut Vec<String>) -> Option<Response>{
         };
         reqwest::get(&src).await
     }
-    for server in mirrors{
+    let mut filtered:Vec<String> = Vec::new();
+    for server in &mut *mirrors{
+        let server:String = {
+            if server.chars().nth(0) == Some('^'){
+                server.clone().split_off(1)
+            }else{
+                server.to_string()
+            }
+        };
         match check(server.as_str(),&name).await{
             Ok(resp) => {
+                filtered.push(server.clone());
                 if resp.status().as_str() == "404"{
                     print_exit(1,"\n  ",false);
                     println!("File {} not found on {}", &name, &server);
@@ -251,15 +285,12 @@ async fn check_fs(name:&str,mirrors:&mut Vec<String>) -> Option<Response>{
                 }
             },
             Err(e) => {
-                //TODO Comprobar como sacar un mirror de aqui
-                // let index = mirrors.iter().position(|y| &*y == server).unwrap();
-                // mirrors.remove(index);
                 if e.is_timeout(){
                     print_exit(1,"  ",false);
                     println!("Timeout");
                 }else if e.is_connect(){
                     print_exit(1,"  ",false);
-                    println!("Unable to connect with {}", {&server});
+                    println!("Unable to connect with {}", &server);
                 }else{
                     print_exit(1,"  ",false);
                     println!("Error: {}", e.status().expect("0"));
@@ -267,10 +298,9 @@ async fn check_fs(name:&str,mirrors:&mut Vec<String>) -> Option<Response>{
             }
         }
     }
+    *mirrors=filtered;
     print_exit(1,"",false);
-
     None
-
 }
 async fn get_file(res:Response,fname:&str) -> String{
     let fs:u64 = res.content_length().expect("Error fetching file size");
@@ -299,7 +329,22 @@ async fn hash_check(file:&str,mirrors:&mut Vec<String>) -> bool{
     bfile.pop();
     bfile.push("b3");
     let mut bfile:String = bfile.join(".");
-    let resp:Response = check_fs(&bfile,mirrors).await.expect("File doesnt exist");
+    let mut masters:Vec<String> = Vec::new();
+    for master in mirrors.iter().take_while(|x|x.chars().nth(0)==Some('^')){
+        masters.push(master.to_string());
+    }
+    let servers:&mut Vec<String> = {
+        if masters.len() >= 1{
+            &mut masters
+        }else{
+            println!("{}","No masters available, file integrity can't be trusted. Continue? y/N".yellow());
+            if ! user_input("n"){
+                return false
+            }
+            mirrors
+        }
+    };
+    let resp:Response = check_fs(&bfile,servers).await.expect("File doesnt exist");
     if resp.status().as_str() == "404"{
         println!("Oh no - File not found, package integrity could not be verified.");
         return false
@@ -310,15 +355,37 @@ async fn hash_check(file:&str,mirrors:&mut Vec<String>) -> bool{
     let file = &(EOKA_TMP.to_owned() + file);
     match File::open(file) {
         Ok(mut file) => {
-            file.read_to_end(&mut bytes);
+            match file.read_to_end(&mut bytes){
+                Ok(_) => (),
+                Err(_) => {
+                    print!("Unable hash file ");
+                    print_exit(1,"",true);
+                    return false
+                }
+            }
             let mut hasher = blake3::Hasher::new();
             let start = Instant::now();
             hasher.update(&bytes);
             let hash = hasher.finalize();
             println!("HASH: {} in {:?}", hash, start.elapsed());
             let mut rhash:String = String::new();
-            File::open(bfile).expect("Unable to open checksum file").read_to_string(&mut rhash);//TODO Handle err
-            return hash.to_string().eq(rhash.split(" ").collect::<Vec<_>>()[0])
+            match File::open(bfile){
+                Ok(mut res) => {
+                    match res.read_to_string(&mut rhash){
+                        Ok(_) => (),
+                        Err(_) => {
+                            print!("Unable to read hash file ");
+                            print_exit(1,"",true);
+                            return false
+                        }
+                    }
+                    return hash.to_string().eq(rhash.split(" ").collect::<Vec<_>>()[0])
+                },
+                Err(e) => {
+                    println!("Unable to open hash file due to -> {}",e);
+                    return false
+                }
+            }
         },
         Err(_) => {
             println!("Unable to open file");
@@ -327,22 +394,49 @@ async fn hash_check(file:&str,mirrors:&mut Vec<String>) -> bool{
 
     }
 }
-async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<String>,upgrade:bool,oldv:&Option<String>){
+async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<String>,upgrade:bool,oldv:&Option<String>) -> bool{
     fn clean_pkg(installed:bool,tempdir:&str,pkg:&str){
-        if ! installed{
-            std::fs::remove_file(format!("{}bps/{}",EOKA_LOCAL,&pkg));
+        let mut failures:u8 = 0;
+        fn rm_file(file:String,failures:&mut u8){
+            let file:&str = file.as_str();
+            match std::fs::remove_file(file){
+                Ok(_)=>(),
+                Err(_) => {
+                    *failures+=1;
+                    println!("\n Unable to remove {}",&file);
+                    print_exit(1,"",true);
+                }
+            }
         }
-        std::fs::remove_dir_all(&tempdir);
-        std::fs::remove_file(format!("{}{}.ek",EOKA_TMP,&pkg));
-        std::fs::remove_file(format!("{}{}.b3",EOKA_TMP,&pkg));
-        print_exit(0,"",true);
+        if ! installed{
+            rm_file(format!("{}bps/{}",EOKA_LOCAL,&pkg),&mut failures);
+        }
+        match std::fs::remove_dir_all(&tempdir){
+            Ok(_)=>(),
+            Err(_) => {
+                failures+=1;
+                println!("\n Unable to remove blueprint");
+                print_exit(1,"",true);
+            }
+        }
+        rm_file(format!("{}{}.ek",EOKA_TMP,&pkg),&mut failures);
+        rm_file(format!("{}{}.b3",EOKA_TMP,&pkg),&mut failures);
+        if failures == 0{
+            print_exit(0,"",true);
+        }
+        if ! installed{
+            println!("{}","Package could not be installed due to above errors".red().bold());
+            return;
+        }
     }
     let pkg:String = format!("{}-{}",pkgname,pkgversion);
     if ! hash_check(format!("{}.ek",&pkg).as_str(),mirrors).await {
-        println!("File integrity check failed, aborting installation...");
-        return;
+        print!("File integrity check failed, aborting installation...");
+        print_exit(1,"",true);
+        return false;
     }else{
-        println!("File integrity passed");
+        print!("File integrity passed ");
+        print_exit(0,"",true);
     }
     let tempdir:&str = &format!("/tmp/build-{}",pkgname);
     FS.create_dir(tempdir.to_string());
@@ -350,18 +444,75 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
     if output.status.success(){
         if ! std::path::Path::new(&(tempdir.to_owned()+"/blueprint")).exists() || ! std::path::Path::new(&(tempdir.to_owned()+"/blueprint")).exists(){
             println!("Package has been wrongly packed");
-            return
+            return false;
         }
+        let mut compiled:bool = true;
+        let mut conf_stdout:Option<&str> = None;
         for pfile in ["blueprint","conf.sh","data.tgz","post.sh"]{
-            let fname:String =tempdir.to_owned()+"/"+pfile;
+            let fname:String = tempdir.to_owned()+"/"+pfile;
             match File::open(&fname){
                 Ok(_) => {
                     match pfile{
                         "blueprint" => {
+                            print!("Fetching mode ");
+                            let lines:Vec<String> = FS.read_file(fname.clone());
+                            fn verify_mode(fname:&String) -> bool{
+                                println!("  Data.tgz root content");
+                                let mut tmp_res:bool = false;
+                                let cmd = Command::new("/bin/tar").args(["-tzf",&fname]).output().expect("Unable to execute");//TODO cambiar a mv
+                                for line in std::str::from_utf8(&cmd.stdout).unwrap().split("\n").take_while(|x| x.matches("/").count() == 1 && x.chars().last() == Some('/')){
+                                    match line{
+                                        "var/"|"bin/"|"opt/"|"usr/"|"home/"|"etc/" => tmp_res=true,
+                                        _ => (),
+                                    }
+                                    println!("{}",format!("    -{}",line).cyan());
+                                }
+                                if tmp_res{
+                                    println!("  Package content seems to be compiled");
+                                }else{
+                                    println!("  Package content seems to be source")
+                                }
+                                println!("  Is it correct? Y/n");
+                                if user_input("y"){
+                                    return tmp_res
+                                }
+                                return !tmp_res
+                            }
+                            let datapath:String = tempdir.to_owned()+"/data.tgz";
+                            {
+                                if lines.len() >= 3{
+                                    match lines[2].split(".").nth(1){
+                                        Some(line) => {
+                                            if line == "source"{
+                                                compiled = false;
+                                                continue
+                                            }else if line == "compiled"{
+                                                compiled = true;
+                                                continue
+                                            }
+                                        },
+                                        None => (),
+                                    }
+                                }
+                                print_exit(1,"",true);
+                                compiled = verify_mode(&datapath);
+                                print!("Managing package as ");
+                                match compiled{
+                                    true => print!("compiled"),
+                                    false => print!("source")
+                                }
+                                print_exit(0," ",true);
+                            }
                             print!("Saving blueprint...");
                             match &oldv{
                                 Some(oldv) => {
-                                    fs::remove_file(format!("{}bps/{}-{}",EOKA_LOCAL,pkgname,oldv));
+                                    match fs::remove_file(format!("{}bps/{}-{}",EOKA_LOCAL,pkgname,oldv)){
+                                        Ok(_) => (),
+                                        Err(e) => {
+                                            print_exit(1,"",true);
+                                            println!("Unable to delete previous blueprint -> {}",e);
+                                        }
+                                    }
                                 },
                                 None => (),
                             }
@@ -377,21 +528,69 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
 
                         }
                         "conf.sh"|"post.sh" => {
+                            /*
+                                Ahora mismo esta shieeeet no funciona, porque el stdout no se imprime cuando toca
+                                 entonces el post.sh no se puede ejecutar correctamente
+                            */
                             print!("Executing {}...",&pfile);
                             let method:&str = if upgrade{
                                 "update"
                             }else{
                                 "install"
                             };
-                            let mut cmd = Command::new("/bin/sh").args([&fname,method]).spawn().expect("Unable to execute");
-                            if ! cmd.wait().unwrap().success() && pfile == "conf.sh"{
-                                print_exit(1,"",true);
-                                clean_pkg(false,tempdir,&pkg);
-                                return
+                            let mut cmd = Command::new("/bin/sh");
+                            cmd.args([&fname,method]);
+                            if pfile == "conf.sh"{
+                                let (mut reader, writer) = os_pipe::pipe().unwrap();
+                                let writer_clone = writer.try_clone().unwrap();
+                                cmd.stdout(writer);
+                                cmd.stderr(writer_clone);
+                                let mut handle = cmd.spawn().unwrap();
+                                drop(cmd);
+                                let mut output = String::new();
+                                match reader.read_to_string(&mut output){
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        print!("Unable to pipe command output due to -> {}",e);
+                                        print_exit(1,"",true);
+                                        clean_pkg(false,tempdir,&pkg);
+                                        return false
+                                    }
+                                }
+                                let res = handle.wait().unwrap();
+                                if ! res.success(){
+                                    print_exit(1,"",true);
+                                    for line in output.split("\n"){
+                                        println!("{}",line);
+                                    }
+                                    print!("conf.sh returned an error, aborting installation...");
+                                    clean_pkg(false,tempdir,&pkg);
+                                    return false
+                                }else{
+                                    conf_stdout=Some("Ci");
+                                }
+                            }else{
+                                let mut cmd = cmd.spawn().expect("Unable to execute");
+                                if ! cmd.wait().unwrap().success(){
+                                    print_exit(1,"",true);
+                                    continue;
+                                }
                             }
-                            println!("[OK]");
+                            print_exit(0,"",true);
                         },
                         "data.tgz" => {
+                            if !compiled{
+                                if conf_stdout.is_none(){
+                                    print!("Package is malformed (source without conf.sh)");
+                                    print_exit(1," ",true);
+                                    print!("Aborting installation and cleaning enviorment...");
+                                    clean_pkg(false,tempdir,&pkg);
+                                    return false
+                                }
+                                print!("Skipping due to package not being precompiled");
+                                print_exit(2," ",true);
+                                continue
+                            }
                             print!("Unpacking source...");
                             output = Command::new("/bin/tar").args(["-xzf",&fname,"-C","/"]).output().expect("Failed to execute");
                             if ! output.status.success(){
@@ -400,7 +599,7 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                                 println!("{}",format!("Package {}-{} could not be installed",&pkgname, &pkgversion).red());
                                 print!("Removing temportal files and aborting...");
                                 clean_pkg(false,tempdir,&pkg);
-                                return
+                                return false
                             }
                             print_exit(0,"",true);
                         },
@@ -427,10 +626,8 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
             .open(EOKA_LOCAL.to_owned()+"lastupdate.log");
         match file{
             Ok(mut file) =>{
-                /*TODO cambiar la forma de obtener lversion
-                    añadir fecha?
-                */
-                writeln!(file,"{}",format!("{} {} -> {}",pkgname,LOCAL.list_pkg(LOCAL.new_con(),&pkgname)[0].lversion,pkgversion)).unwrap();
+                let timestamp: i64 = chrono::Utc::now().timestamp();
+                writeln!(file,"{}",format!("[{}]{} {} -> {}",timestamp,pkgname,LOCAL.list_pkg(LOCAL.new_con(),&pkgname)[0].lversion,pkgversion)).unwrap();
             }
             Err(e) =>{
                 println!("Unable to open the log file -> {}",e);
@@ -441,17 +638,26 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
     LOCAL.update_pkg(LOCAL.new_con(), &pkgname.to_string(), &pkgversion.to_string(), "lversion",&None);
     println!("{}",format!("Package {}-{} has been installed correctly",&pkgname, &pkgversion).green());
     print!("Cleaning enviorment...");
-    clean_pkg(true,tempdir,&pkg);//TODO saber que coño contiene cada uno porque necesito muchas cosas
+    clean_pkg(true,tempdir,&pkg);
+    true
 }
 async fn reqwest_dependencies(bpdeps:&String,mirrors:&mut Vec<String>) -> Option<Vec<Vec<reqwest::Response>>>{
     let mut result:Vec<Vec<Response>>=Vec::new();
     let bpdeps:Vec<&str>=bpdeps.split(":").collect();
     let mut deps:Vec<Response> = Vec::new();
-    for dep in bpdeps[0].split(","){//TODO checkear si dep contiene la version
+    for dep in bpdeps[0].split(","){
         if dep == ""{
             continue;
         }
-        match check_fs(format!("{}-{}.ek",dep,LOCAL.list_pkg(LOCAL.new_con(),dep).first().unwrap().rversion).as_str(),mirrors).await{
+        let dep_v:String;
+        let split:Vec<&str> = dep.split("=").collect();
+        if split.len() == 1{
+            let db_v = LOCAL.list_pkg(LOCAL.new_con(),dep);
+            dep_v=db_v[0].rversion.clone();
+        }else{
+            dep_v=split[1].to_string();
+        }
+        match check_fs(&format!("{}-{}.ek",dep,dep_v),mirrors).await{
             None => {
                 print_exit(1,"     ",false);
                 println!("Unable to fetch {:?}", dep);
@@ -475,13 +681,13 @@ async fn reqwest_dependencies(bpdeps:&String,mirrors:&mut Vec<String>) -> Option
             res => opts.push(res.unwrap()),
         }
     }
-    result.push(opts);//TODO optimizar esto
+    result.push(opts);
     Some(result)
 }
-async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:bool){
+async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:bool) -> bool{
     let pkgname = package.to_string();
     let mut oldv:Option<String> = None;
-    let mut pkg:Vec<&str> = {//TODO mover esto a otro sitio o dejarlo
+    let mut pkg:Vec<&str> = {
         if pkgname.contains("="){
             pkgname.split("=").collect()
         }else{
@@ -494,13 +700,13 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
         None => {
             print_exit(1,"",false);
             println!("Unable to find package {} try again after eoka sync",pkg[0]);
-            return
+            return false;
         }
     };
     if &dbversion.name == ""{
         print_exit(1,"",false);
         println!("  Unable to find package {} try again after eoka sync", pkg[0]);
-        return;
+        return false;
     }else{
         if pkg.len() == 1{
             pkg.push(&dbversion.rversion);
@@ -510,13 +716,13 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
         println!("The package {} is already in the latest version {}",&dbversion.name,&dbversion.lversion);
         println!("Do you want to reinstall it? y/N");
         if ! user_input("n"){
-            return;
+            return false;
         } 
     }else if &dbversion.lversion != "0"{
         println!("The package {} is installed with version {} and you are trying to install {}",&dbversion.name,&dbversion.lversion,pkg[1]);
-        println!("Do you want to upgrade/downgrade it? y/N");//TODO dar opcion para instarlo independientemente
+        println!("Do you want to upgrade/downgrade it? y/N");
         if ! user_input("n"){
-            return;
+            return false;
         }
         upgrade=true;
         oldv=Some(dbversion.lversion.clone());
@@ -546,19 +752,19 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
             if resp.status().as_str() == "404"{
                 print_exit(1,"",true);
                 println!("File not found on this mirror");
-                return 
+                return false
             }
             print_exit(0,"",true);
             resp
         },
         None => {
             println!("{}",format!("Package {} with version {} not found",pkg[0],pkg[1]).red());
-            return
+            return false
         }
     };
     let fops:Vec<Response>;
     let mut fdeps:Vec<Response> = Vec::new();
-    match deps{//TODO dejarlo bonito
+    match deps{
         Some(mut e) => {
             let dsize:u64 = {
                 if e.len() != 0{
@@ -597,13 +803,13 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
             if ! &dbversion.deps.is_none(){
                 print_exit(1,"",false);
                 println!("Failure while obtaining package dependencies, cannot install the package.");
-                return
+                return false
             }
         },
     }
     println!("Eoka will need to download {} to install {} continue? Y/n",human_bytes(resp.content_length().expect("Failed to retrieve fs") as f64),pkg[0]);
     if ! user_input("y"){
-        return;
+        return false;
     }
     if fdeps.len() != 0 {
         for dep in fdeps{
@@ -619,7 +825,7 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
             unpack(&dep_n,&dep_v,get_file(dep,&format!("{}-{}.ek",dep_n,dep_v)).await, mirrors, upgrade,&oldv).await;
         }
     }
-    unpack(pkg[0],pkg[1], get_file(resp,tgzname).await, mirrors,upgrade,&oldv).await;
+    unpack(pkg[0],pkg[1], get_file(resp,tgzname).await, mirrors,upgrade,&oldv).await
 }
 fn package_remove(package:String,fetch:bool){
     let mut package:Vec<&str> = package.split("=").collect();
@@ -774,6 +980,23 @@ fn package_remove(package:String,fetch:bool){
     }
     return
 }
+fn print_deps(pdeps:&Option<String>){
+    println!("\n - Dependencies:");
+    match pdeps{
+        Some(deps) =>{
+            let depes:Vec<&str> = deps.split(":").collect();
+            for dep in depes[0].split(","){
+                println!("   + {}", dep);
+            }
+            for opt in depes[1].split(","){
+                if opt != ""{
+                    println!("   + {} (Optional)", opt);
+                }
+            }
+        },
+        None => println!("    None"),
+    }
+}
 #[tokio::main]
 async fn main(){
     let mut args:Vec<String> = env::args().collect();
@@ -786,10 +1009,12 @@ async fn main(){
                 get_file(res.expect(""),&REMOTE.name).await;
 
                 if ! hash_check("eoka.db",&mut mirrors).await {
-                    println!("File integrity check failed, aborting update...");
+                    print!("File integrity check failed, aborting update...");
+                    print_exit(1,"",true);
                     return;
                 }else{
-                    println!("File integrity passed");
+                    print!("File integrity passed ");
+                    print_exit(0,"",true);
                 }
                 let packages = REMOTE.list_pkg(REMOTE.new_con(),"%");
                 let pb = ProgressBar::new(packages.len().try_into().unwrap());
@@ -808,17 +1033,23 @@ async fn main(){
                         n+=1;
                     }else{
                         let lpackage = &lpackages[&pack.name];
-                        //TODO notifico cuando hay una actualizacion en la bbdd o solo cuando están instalados
                         if cmp_v(&lpackage.rversion, &pack.rversion){
                             LOCAL.update_pkg(LOCAL.new_con(), &pack.name, &pack.rversion, "rversion", &pack.deps);
-                            u+=1;
+                            if &pack.lversion != "0"{
+                                u+=1;
+                            }
                         }
                     }
                     pb.set_message(pack.name);
                     pb.inc(1);
                 }
                 pb.finish_with_message("Finished updating the dabase");
-                fs::remove_file(&REMOTE.path);//TODO handle err
+                match fs::remove_file(&REMOTE.path){
+                    Ok(_) => (),
+                    Err(e) => {
+                        println!("Unable to remove {} due to {}",&REMOTE.path,e);
+                    }
+                }
                 println!("Update endeded with {} new packages, and {} updates available.",&n,&u);
                 return
             },
@@ -827,13 +1058,14 @@ async fn main(){
                 if args.len() == x+1{
                     let mut up = 0;
                     for package in LOCAL.list_pkg(LOCAL.new_con(),"%"){
-                        if package.lversion == "0" || package.lversion == package.rversion {
+                        if package.lversion == "0" || package.lversion == package.rversion || package.rversion == "" {
                             continue;
                         }
-                        package_install(package.name,&mut mirrors,true).await;
-                        up+=1;
+                        if package_install(package.name,&mut mirrors,true).await{
+                            up+=1;
+                        }
                     }
-                    println!("{} packages upgraded",up);
+                    println!("Packages upgraded: {}",up);
                 }else{
                     let packages:Vec<String>=args.drain(x+1..).collect();
                     for pak in packages{
@@ -846,36 +1078,37 @@ async fn main(){
                 let packages:Vec<String>=args.drain(x+1..).collect();
                 let mut mirrors:Vec<String> = fetch_mirrors().await;
                 for package in packages{
-                    package_install(package,&mut mirrors,false).await
+                    package_install(package,&mut mirrors,false).await;
                 }
                 return
             },
+            "-Q"|"query"=>{
+                let packages:Vec<String>=args.drain(x+1..).collect();
+                for package in packages{
+                    let package:&Package = &LOCAL.list_pkg(LOCAL.new_con(),&package)[0];
+                    println!("");
+                    println!("{}",format!("Package {} -----------", &package.name).cyan());
+                    if &package.lversion == &package.rversion{
+                        print!(" - Local version: {}",&package.lversion);
+                    }else{
+                        if &package.lversion != "0"{
+                            print!(" - Local version: {} => Last version: {}", &package.lversion, &package.rversion);
+                        }else{
+                            print!(" - Available version: {}", &package.rversion);
+                        }
+                    }
+                    print_deps(&package.deps);
+                }
+                return
+            }
             "-L"|"list" => {
                 if args.len() == x+1{
                     args.push("all".to_string());
                 }
                 let mut tot = 0;
-                fn print_deps(pdeps:&Option<String>){
-                    match pdeps{
-                        Some(deps) =>{
-                            println!("\n - Dependencies:");
-                            let depes:Vec<&str> = deps.split(":").collect();
-                            for dep in depes[0].split(","){
-                                println!("   + {}", dep);
-                            }
-                            for opt in depes[1].split(","){
-                                if opt != ""{
-                                    println!("   + {} (Optional)", opt);
-                                }
-                            }
-                        },
-                        None => println!(""),
-                    }
-                }
                 println!("Listing {} packages:",args[x+1]);
                 match args[x+1].as_str(){
                     "upgradable" =>{
-                        //Por cada paquete mostrar version instalada y la nueva, con un total de archivos.
                         for package in LOCAL.list_pkg(LOCAL.new_con(),"%"){
                             if &package.lversion == &"0"{
                                 continue
@@ -898,9 +1131,8 @@ async fn main(){
                                 print_deps(&package.deps);
                             }
                         }
-                        //Por cada paquete mostrar nombre, version y dependencias
                     },
-                    "updated"|"updated" =>{
+                    "upgraded"|"updated" =>{
                         for line in FS.read_file(EOKA_LOCAL.to_owned()+"lastupdate.log"){
                             println!("{}",line);
                         }
@@ -908,11 +1140,13 @@ async fn main(){
                     },
                     "all" =>{
                         for package in LOCAL.list_pkg(LOCAL.new_con(),"%"){
-                            println!("Package {}", package.name);
+                            println!("");
+                            println!("{}",format!("Package {} -----------", &package.name).cyan());
+                            print!(" - Local version: {} => Available version: {}", &package.lversion, &package.rversion);
+                            print_deps(&package.deps);
                         }
-                        //Mostrar todos los paquetes
                     }
-                    e => {//TODO mostrar informacion de paquete
+                    e => {
                         println!("error: Option {} does not exist, use eoka list -h to list available options",e);
                     }
                 }
