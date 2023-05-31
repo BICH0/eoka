@@ -443,7 +443,7 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
     }
     let tempdir:&str = &format!("/tmp/build-{}",pkgname);
     FS.create_dir(tempdir.to_string());
-    let mut output = Command::new("/bin/tar").args(["-xzf",&path,"-C",&tempdir]).output().expect("Failed to execute");
+    let mut output = Command::new("/bin/tar").args(["-xzhf",&path,"-C",&tempdir]).output().expect("Failed to execute");
     if output.status.success(){
         if ! std::path::Path::new(&(tempdir.to_owned()+"/blueprint")).exists() || ! std::path::Path::new(&(tempdir.to_owned()+"/blueprint")).exists(){
             println!("Package has been wrongly packed");
@@ -459,10 +459,10 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                         "blueprint" => {
                             print!("Fetching mode ");
                             let lines:Vec<String> = FS.read_file(fname.clone());
-                            fn verify_mode(fname:&String) -> bool{
+                            fn verify_mode(path:&String) -> bool{
                                 println!("  Data.tgz root content");
                                 let mut tmp_res:bool = false;
-                                let cmd = Command::new("/bin/tar").args(["-tzf",&fname]).output().expect("Unable to execute");//TODO cambiar a mv
+                                let cmd = Command::new("/bin/tar").args(["-tzf",&path]).output().expect("Unable to execute");
                                 for line in std::str::from_utf8(&cmd.stdout).unwrap().split("\n").take_while(|x| x.matches("/").count() == 1 && x.chars().last() == Some('/')){
                                     match line{
                                         "var/"|"bin/"|"opt/"|"usr/"|"home/"|"etc/" => tmp_res=true,
@@ -484,6 +484,7 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                             let datapath:String = tempdir.to_owned()+"/data.tgz";
                             {
                                 if lines.len() >= 3{
+                                    println!("MAY CONTAIN MODE {:?}",lines);
                                     let split:Vec<&str> = lines[2].split(":").collect();
                                     if split[0] == "Mode"{
                                         if split[1] == ""{
@@ -514,7 +515,7 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                             print!("Saving blueprint...");
                             match &oldv{
                                 Some(oldv) => {
-                                    match fs::remove_file(format!("{}bps/{}-{}",EOKA_LOCAL,pkgname,oldv)){
+                                    match fs::remove_file(format!("{}bps/{}-{}.gz",EOKA_LOCAL,pkgname,oldv)){
                                         Ok(_) => (),
                                         Err(e) => {
                                             print_exit(1,"",true);
@@ -524,22 +525,25 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                                 },
                                 None => (),
                             }
-                            match fs::copy(&fname, format!("{}bps/{}-{}",EOKA_LOCAL,pkgname,pkgversion)){
-                                Ok(_) => print_exit(0,"",true),
-                                Err(e) => {
-                                    print_exit(1,"",false);
-                                    println!("-> {}", e)
-                                },
+                            let cmd = Command::new("/bin/gzip").args([&fname]).output().expect("Unable to execute command");//TODO Formatear estas lineas con [ok] y tal
+                            if cmd.status.success() { 
+                                match fs::copy(fname+".gz",&format!("{}bps/{}-{}.gz",EOKA_LOCAL,pkgname,pkgversion)){
+                                    Ok(_) => print_exit(0,"",true),
+                                    Err(e) => {
+                                        print_exit(1,"",true);
+                                        println!("-> {}", e);
+                                        clean_pkg(false,tempdir,&pkg);
+                                        return false
+                                    }
+                                }
+                            }else{
+                                print_exit(1,"",true);
+                                println!("-> {}", String::from_utf8(cmd.stderr).unwrap());
+                                clean_pkg(false,tempdir,&pkg);
+                                return false
                             }
-                            // let mut cmd = Command::new("/bin/tar").args(["-czf","blueprint","-C",&format!("{}.tgz",&pkg)]).spawn().expect("Unable to execute");//TODO cambiar a mv
-                            // cmd.wait();
-
                         }
                         "conf.sh"|"post.sh" => {
-                            /*
-                                Ahora mismo esta shieeeet no funciona, porque el stdout no se imprime cuando toca
-                                 entonces el post.sh no se puede ejecutar correctamente
-                            */
                             print!("Executing {}...",&pfile);
                             let method:&str = if upgrade{
                                 "update"
@@ -600,7 +604,7 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
                                 continue
                             }
                             print!("Unpacking source...");
-                            output = Command::new("/bin/tar").args(["-xzf",&fname,"-C","/"]).output().expect("Failed to execute");
+                            output = Command::new("/bin/tar").args(["-xzhf",&fname,"-C","/"]).output().expect("Failed to execute");
                             if ! output.status.success(){
                                 print_exit(1," ",false);
                                 println!("An error ocurred while extracting data \n{}", String::from_utf8(output.stderr).unwrap());
@@ -627,21 +631,40 @@ async fn unpack(pkgname:&str, pkgversion:&str, path:String, mirrors:&mut Vec<Str
         }
     }else{
         println!("An error ocurred while extracting package {:?}", String::from_utf8(output.stderr).unwrap());
+        return false
     }
     if upgrade {
-        let file = OpenOptions::new()
+        for _ in 0..2{
+            let file = OpenOptions::new()
             .append(true)
             .open(EOKA_LOCAL.to_owned()+"lastupdate.log");
-        match file{
-            Ok(mut file) =>{
-                let timestamp: i64 = chrono::Utc::now().timestamp();
-                writeln!(file,"{}",format!("[{}]{} {} -> {}",timestamp,pkgname,LOCAL.list_pkg(LOCAL.new_con(),&pkgname)[0].lversion,pkgversion)).unwrap();
-            }
-            Err(e) =>{
-                println!("Unable to open the log file -> {}",e);
+            match file{
+                Ok(mut file) =>{
+                    let timedate:String = {
+                        let naive_local = chrono::Local::now().naive_local();
+                        format!("{}", naive_local.format("%d/%m/%Y-%H:%M"))
+                    };
+                    writeln!(file,"{}",format!("[{}] {} {} -> {}",timedate,pkgname,LOCAL.list_pkg(LOCAL.new_con(),&pkgname)[0].lversion,pkgversion)).unwrap();
+                    break;
+                }
+                Err(e) =>{
+                    print!("Unable to open the log file");
+                    if e.kind().to_string() == "entity not found"{
+                        println!("\n Creating new");
+                        match File::create(EOKA_LOCAL.to_owned()+"lastupdate.log"){
+                            Ok(_) => print_exit(0,"",true),
+                            Err(e) => {
+                                print_exit(1,"",true);
+                                println!("{}",format!(" ⌙--> {}",e).red().bold());
+
+                            }
+                        }
+                    }else{
+                        println!("-> {}",e.kind());
+                    }
+                }
             }
         }
-
     }
     LOCAL.update_pkg(LOCAL.new_con(), &pkgname.to_string(), &pkgversion.to_string(), "lversion",&None);
     println!("{}",format!("Package {}-{} has been installed correctly",&pkgname, &pkgversion).green());
@@ -734,6 +757,14 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
         }
         upgrade=true;
         oldv=Some(dbversion.lversion.clone());
+    }else{
+        if upgrade{
+            println!("Package {} is not installed, do you want to install it? Y/n",package);
+            if ! user_input("y"){
+                return false;
+            }
+            upgrade=false;
+        }
     }
     if upgrade {
         println!("Upgrading package {}", pkg[0]);
@@ -741,7 +772,7 @@ async fn package_install(package:String,mirrors:&mut Vec<String>,mut upgrade:boo
     }else{
         println!("Installing package {}", pkg[0]);
     }
-    let bpdeps = dbversion.deps.clone();//Cojo las dependencias de la base de datos
+    let bpdeps = dbversion.deps.clone();
     let deps:Option<Vec<Vec<reqwest::Response>>> = {
         match bpdeps{
             Some(bpdeps) => {
@@ -851,16 +882,27 @@ fn package_remove(package:String,fetch:bool){
         }
     };
     println!("Removing package {}",&package[0]);
+    println!("Are you sure you want to continue? Y/n");
+    if ! user_input("y"){
+        return
+    }
     if package.len() == 1{
         package.push(&dbpkg.lversion);
     }
-    let lines:Vec<String> = FS.read_file(EOKA_LOCAL.to_owned() + "bps/" + &package[0] + "-" + &package[1]);
+    let bpath:&str=&format!("{}bps/{}-{}",EOKA_LOCAL,&package[0],&package[1]);
+    let cmd = Command::new("/bin/gzip").args([&(bpath.to_owned()+".gz"),"-d","--force"]).output().expect("Unable to execute");
+    if ! cmd.status.success(){
+        print_exit(1,"",false);
+        println!("Unable to unpack {}.gz",bpath);
+    }
+    let lines:Vec<String> = FS.read_file(bpath.to_string());
+
     if lines.len() == 0{
         print_exit(1,"",false);
         if package[1] != &dbpkg.lversion{
             println!("Package {} is installed with version {}\nTry again with eoka remove {}={} or eoka remove {}",&package[0],&dbpkg.lversion,&package[0],&dbpkg.lversion,&package[0])
         }else{
-            println!("Package {} is installed but no blueprint exist or is corrupted ({})", &package[0],format!("{}bps/{}-{}",EOKA_LOCAL.to_owned(),&package[0],&package[1]));
+            println!("Package {} is installed but no blueprint exist or is corrupted ({})", &package[0],bpath);
         }
         return
     }
@@ -878,7 +920,7 @@ fn package_remove(package:String,fetch:bool){
                         "Dependencies" => {
                             if fetch{
                                 if line[1] == "" && line[3] == ""{
-                                    break;
+                                    continue;
                                 }
                                 println!("Package has some dependencies, do you want to uninstall them whenever is possible (no package has depency on it) Y/n");
                                 if user_input("y") {
@@ -925,19 +967,32 @@ fn package_remove(package:String,fetch:bool){
                                         .progress_chars("=> ")
                                     );
                                     for path in paths{
+                                        let path:String = {
+                                            if path.chars().nth(0).unwrap() == '/'{
+                                                path.to_string()
+                                            }else{
+                                                "/".to_owned()+path
+                                            }
+                                        };
                                         match fs::remove_dir_all(&path){
                                             Err(e) => {
-                                                if e.to_string() == "Not a directory (os error 20)"{
-                                                    match fs::remove_file(&path){
-                                                        Err(e) => {
-                                                            println!("This path could not be removed, aborting due to {}",e);
-                                                            return Some(Vec::new());
-                                                        },
-                                                        Ok(_) => (),
+                                                match e.to_string().split("(").nth(1).unwrap(){
+                                                    "os error 20)" => {
+                                                        match fs::remove_file(&path){
+                                                            Err(e) => {
+                                                                println!("This path could not be removed, aborting due to {}",e);
+                                                                return Some(Vec::new())
+                                                            },
+                                                            Ok(_) => (),
+                                                        }
+                                                    },
+                                                    "os error 2)" =>{
+                                                        continue
                                                     }
-                                                }else{
-                                                    println!("This path could not be removed, aborting due to {}",e);
-                                                    return Some(Vec::new());
+                                                    e => {
+                                                        println!("This path could not be removed, aborting due to {}",e);
+                                                        return Some(Vec::new())
+                                                    }
                                                 }
                                             },
                                             Ok(_) =>{
@@ -949,7 +1004,7 @@ fn package_remove(package:String,fetch:bool){
                                 }
                             }
                         },
-                        uk => println!("Unknwon line {}",uk),
+                        uk => println!("Unknown line {}",uk),
                     }
                 },
                 
@@ -959,6 +1014,10 @@ fn package_remove(package:String,fetch:bool){
     }
     match iter(&package[0],lines,fetch){
         Some(deps) => {
+            if deps.len() == 0{
+                print_exit(1,"",false);
+                return
+            }
             let pb = ProgressBar::new(deps.len().try_into().unwrap());
             pb.set_style(ProgressStyle::with_template("[{elapsed_precise}] [{bar:40.cyan}] {pos}/{len} ({msg}, {eta})").unwrap()
                 .progress_chars("=> ")
@@ -972,13 +1031,13 @@ fn package_remove(package:String,fetch:bool){
             package_remove(package[0].to_string(),false);
         },
         None => {
-            println!("{}",format!("Package {} has been uninstalled",&package[0]).green());
+            println!("\n{}",format!("Package {} has been uninstalled",&package[0]).green());
         }
     }
     print!("Flushing database ");
     LOCAL.update_pkg(LOCAL.new_con(), &package[0], &"0".to_string(), "lversion", &dbpkg.deps);
     print_exit(0,"",true);
-    // print!("Cleaning system ");
+    print!("Cleaning system ");
     match fs::remove_file(format!("{}bps/{}-{}",EOKA_LOCAL,package[0],package[1])){
         Ok(_) => print_exit(0,"",true),
         Err(e) => {
@@ -1067,7 +1126,7 @@ async fn main(){
                         println!("Unable to remove {} due to {}",&REMOTE.path,e);
                     }
                 }
-                println!("Update endeded with {} new packages, and {} updates available.",&n,&u);
+                println!("Update endeded with {} new packages, and {} new updates available.",&n,&u);
                 return
             },
             "-U"|"upgrade" => {
@@ -1076,6 +1135,7 @@ async fn main(){
                     let mut up = 0;
                     for package in LOCAL.list_pkg(LOCAL.new_con(),"%"){
                         if package.lversion == "0" || package.lversion == package.rversion || package.rversion == "" {
+                            //revisar
                             continue;
                         }
                         if package_install(package.name,&mut mirrors,true).await{
@@ -1153,12 +1213,17 @@ async fn main(){
                         for line in FS.read_file(EOKA_LOCAL.to_owned()+"lastupdate.log"){
                             println!("{}",line);
                         }
-                        //Mostrar los ultimos paquetes actualizados antiguo -> nuevo
                     },
                     "all" =>{
                         for package in LOCAL.list_pkg(LOCAL.new_con(),"%"){
+                            tot+=1;
                             println!("");
-                            println!("{}",format!("Package {} -----------", &package.name).cyan());
+                            let installed:&str = if package.lversion != "0"{
+                                " (installed)"
+                            }else{
+                                ""
+                            };
+                            println!("{}",format!("Package {}{} -----------", &package.name,installed).cyan());
                             print!(" - Local version: {} => Available version: {}", &package.lversion, &package.rversion);
                             print_deps(&package.deps);
                         }
