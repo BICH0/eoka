@@ -20,7 +20,7 @@ extern "C" {
 
 const EOKA_TMP:&str = "/tmp/";
 const EOKA_LOCAL:&str = "/etc/eoka/";
-const VERSION:&str = "0.1.0";
+const VERSION:&str = "1.0.0";
 lazy_static! {
     static ref LOCAL:SQLite = SQLite::new("eoka.db",EOKA_LOCAL);//Cambiar segundo campo a eoka_local
     static ref REMOTE:SQLite = SQLite::new("eoka.db",EOKA_TMP);
@@ -1249,6 +1249,7 @@ async fn main(){
             }
             "-v"|"--version" =>{
                 println!("Eoka {}",VERSION)
+                return
             }
             _ => println!("Argument {} unrecognised.",args[x])
         }
