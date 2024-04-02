@@ -4,7 +4,7 @@
   ### Eoka  
   
   Linux package manager made with Rust!! It uses its own mirror servers and package format, for more info about this head to the [Autoturret GitHub (Mirror structure)](https://github.com/BICH0/Autoturret)
-  This project forms part of the CNFOs project, its currently in a ver primitive state and development is not expected early but feel free to peak on the code and use it in whichever form you wish (Complying with the License this currently under)
+  This project forms part of the CNFOs project, its currently in a very primitive state and development is not expected early, but, feel free to peak on the code and use it in whichever form you wish (Complying with the License it's currently under)
   
   [**Explore the docs »**](https://github.com/BiCH0/eoka)  
   [Live Demo](https://github.com/BiCH0/eoka/#Demo) · [Report Bug](https://github.com/BiCH0/eoka/issues) · [Request Feature](https://github.com/BiCH0/eoka/issues)
